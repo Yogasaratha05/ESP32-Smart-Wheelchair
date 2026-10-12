@@ -1,0 +1,668 @@
+
+/*
+ * ESP32 Smart Wheelchair
+ * Features:
+ * 1. Bluetooth Voice Control
+ * 2. GPS Location Tracking
+ * 3. Obstacle Detection
+ * 4. Web Dashboard
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <TinyGPSPlus.h>
+#include <BluetoothSerial.h>
+
+// ==================== WIFI CONFIGURATION ====================
+
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// ==================== PIN DEFINITIONS ====================
+
+#define IN1         26
+#define IN2         27
+#define IN3         14
+#define IN4         12
+
+#define ENA         25
+#define ENB         33
+
+#define IR_SENSOR   13
+#define BUZZER      5
+
+#define GPS_RX      22
+#define GPS_TX      23
+
+// ==================== GLOBAL OBJECTS ====================
+
+WebServer server(80);
+TinyGPSPlus gps;
+BluetoothSerial SerialBT;
+HardwareSerial GPS_Serial(2);
+
+// ==================== SYSTEM VARIABLES ====================
+
+String currentCmd = "S";
+
+int motorSpeed = 180;
+
+volatile bool obstacle = false;
+volatile bool emergencyStop = false;
+volatile bool buzzerTest = false;
+
+float latitude = 0.0;
+float longitude = 0.0;
+float speedKPH = 0.0;
+
+int satellites = 0;
+bool gpsFixed = false;
+
+// ==================== MOTOR CONTROL ====================
+
+void stopMotors() {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, LOW);
+
+    analogWrite(ENA, 0);
+    analogWrite(ENB, 0);
+}
+
+void motorControl(String cmd, int spd) {
+
+    if (emergencyStop || obstacle || cmd == "S") {
+        stopMotors();
+        return;
+    }
+
+    spd = constrain(spd, 0, 255);
+
+    if (cmd == "F") {
+        digitalWrite(IN1, HIGH);
+        digitalWrite(IN2, LOW);
+        digitalWrite(IN3, HIGH);
+        digitalWrite(IN4, LOW);
+    }
+    else if (cmd == "B") {
+        digitalWrite(IN1, LOW);
+        digitalWrite(IN2, HIGH);
+        digitalWrite(IN3, LOW);
+        digitalWrite(IN4, HIGH);
+    }
+    else if (cmd == "L") {
+        digitalWrite(IN1, LOW);
+        digitalWrite(IN2, HIGH);
+        digitalWrite(IN3, HIGH);
+        digitalWrite(IN4, LOW);
+    }
+    else if (cmd == "R") {
+        digitalWrite(IN1, HIGH);
+        digitalWrite(IN2, LOW);
+        digitalWrite(IN3, LOW);
+        digitalWrite(IN4, HIGH);
+    }
+    else {
+        stopMotors();
+        return;
+    }
+
+    analogWrite(ENA, spd);
+    analogWrite(ENB, spd);
+}
+
+// ==================== OBSTACLE DETECTION TASK ====================
+
+void obstacleTask(void* parameter) {
+
+    while (true) {
+
+        if (digitalRead(IR_SENSOR) == LOW) {
+
+            obstacle = true;
+            stopMotors();
+            digitalWrite(BUZZER, HIGH);
+
+            Serial.println("[!] OBSTACLE DETECTED");
+            SerialBT.println("OBSTACLE");
+
+        } else {
+
+            obstacle = false;
+
+            if (!buzzerTest) {
+                digitalWrite(BUZZER, LOW);
+            }
+        }
+
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+}
+
+// ==================== GPS TASK ====================
+
+void gpsTask(void* parameter) {
+
+    while (true) {
+
+        while (GPS_Serial.available() > 0) {
+            gps.encode(GPS_Serial.read());
+        }
+
+        if (gps.location.isUpdated()) {
+
+            latitude = gps.location.lat();
+            longitude = gps.location.lng();
+
+            speedKPH = gps.speed.kmph();
+            satellites = gps.satellites.value();
+
+            gpsFixed = gps.location.isValid();
+
+            if (gpsFixed) {
+                Serial.println("[GPS] Location Updated");
+            }
+        }
+
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
+// ==================== BLUETOOTH CONTROL TASK ====================
+
+void bluetoothTask(void* parameter) {
+
+    String command = "";
+
+    while (true) {
+
+        if (SerialBT.available()) {
+
+            char c = SerialBT.read();
+
+            if (c == '\n' || c == '\r') {
+
+                command.trim();
+                command.toUpperCase();
+
+                if (command == "F" ||
+                    command == "FORWARD" ||
+                    command == "GO") {
+
+                    currentCmd = "F";
+                    emergencyStop = false;
+                    motorControl("F", motorSpeed);
+                    SerialBT.println("FORWARD");
+
+                }
+                else if (command == "B" ||
+                         command == "BACKWARD" ||
+                         command == "BACK") {
+
+                    currentCmd = "B";
+                    emergencyStop = false;
+                    motorControl("B", motorSpeed);
+                    SerialBT.println("BACKWARD");
+
+                }
+                else if (command == "L" || command == "LEFT") {
+
+                    currentCmd = "L";
+                    emergencyStop = false;
+                    motorControl("L", motorSpeed);
+                    SerialBT.println("LEFT");
+
+                }
+                else if (command == "R" || command == "RIGHT") {
+
+                    currentCmd = "R";
+                    emergencyStop = false;
+                    motorControl("R", motorSpeed);
+                    SerialBT.println("RIGHT");
+
+                }
+                else if (command == "S" ||
+                         command == "STOP" ||
+                         command == "HALT") {
+
+                    currentCmd = "S";
+                    emergencyStop = true;
+                    stopMotors();
+                    SerialBT.println("STOPPED");
+
+                }
+                else if (command == "FASTER") {
+
+                    motorSpeed = min(255, motorSpeed + 25);
+                    SerialBT.printf("SPEED: %d\n", motorSpeed);
+
+                }
+                else if (command == "SLOWER") {
+
+                    motorSpeed = max(80, motorSpeed - 25);
+                    SerialBT.printf("SPEED: %d\n", motorSpeed);
+
+                }
+                else if (command == "WHERE" ||
+                         command == "LOCATION" ||
+                         command == "GPS") {
+
+                    if (gpsFixed) {
+
+                        SerialBT.printf(
+                            "LAT: %.6f LNG: %.6f\n",
+                            latitude,
+                            longitude
+                        );
+
+                        SerialBT.printf(
+                            "SPEED: %.1f km/h SAT: %d\n",
+                            speedKPH,
+                            satellites
+                        );
+
+                        SerialBT.printf(
+                            "MAP: https://maps.google.com/?q=%.6f,%.6f\n",
+                            latitude,
+                            longitude
+                        );
+
+                    } else {
+                        SerialBT.println("Waiting for GPS fix");
+                    }
+
+                }
+                else if (command == "STATUS") {
+
+                    SerialBT.printf(
+                        "CMD: %s SPEED: %d OBSTACLE: %s GPS: %s\n",
+                        currentCmd.c_str(),
+                        motorSpeed,
+                        obstacle ? "YES" : "NO",
+                        gpsFixed ? "FIXED" : "WAIT"
+                    );
+
+                }
+                else if (command == "HELP") {
+
+                    SerialBT.println(
+                        "Commands: F B L R S FASTER SLOWER WHERE STATUS HELP"
+                    );
+
+                }
+                else if (command.length() > 0) {
+
+                    SerialBT.println("Unknown command. Type HELP");
+                }
+
+                command = "";
+
+            } else if (command.length() < 40) {
+                command += c;
+            }
+        }
+
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
+// ==================== WEB DASHBOARD ====================
+
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Smart Wheelchair</title>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #eef2ff;
+            margin: 0;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: auto;
+        }
+
+        .card {
+            background: white;
+            padding: 20px;
+            margin-bottom: 15px;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px #0001;
+        }
+
+        h1, h3 {
+            color: #4f46e5;
+        }
+
+        button {
+            padding: 14px 18px;
+            margin: 5px;
+            border: none;
+            border-radius: 8px;
+            background: #4f46e5;
+            color: white;
+            cursor: pointer;
+        }
+
+        .stop {
+            background: #dc2626;
+        }
+
+        .info {
+            padding: 10px;
+            background: #f3f4f6;
+            margin: 8px 0;
+            border-radius: 6px;
+        }
+
+        iframe {
+            width: 100%;
+            height: 250px;
+            border: 0;
+        }
+    </style>
+</head>
+
+<body>
+<div class="container">
+
+    <div class="card">
+        <h1>Smart Wheelchair</h1>
+        <p>ESP32 Wheelchair Monitoring Dashboard</p>
+        <p id="status">Connecting...</p>
+    </div>
+
+    <div class="card">
+        <h3>Movement Control</h3>
+
+        <button onclick="send('F')">Forward</button>
+        <button onclick="send('L')">Left</button>
+        <button class="stop" onclick="send('S')">STOP</button>
+        <button onclick="send('R')">Right</button>
+        <button onclick="send('B')">Backward</button>
+
+        <p>
+            Speed: <span id="speedValue">180</span>
+        </p>
+
+        <input
+            type="range"
+            id="speed"
+            min="80"
+            max="255"
+            value="180"
+            onchange="setSpeed(this.value)"
+        >
+    </div>
+
+    <div class="card">
+        <h3>GPS Location</h3>
+
+        <div class="info">Latitude: <span id="lat">--</span></div>
+        <div class="info">Longitude: <span id="lng">--</span></div>
+        <div class="info">Speed: <span id="gpsSpeed">--</span> km/h</div>
+        <div class="info">Satellites: <span id="sat">--</span></div>
+
+        <iframe id="map"
+            src="https://maps.google.com/maps?q=0,0&z=15&output=embed">
+        </iframe>
+    </div>
+
+    <div class="card">
+        <h3>Safety Monitoring</h3>
+        <p id="obstacle">Obstacle status: --</p>
+        <button class="stop" onclick="send('S')">
+            Emergency Stop
+        </button>
+    </div>
+
+</div>
+
+<script>
+    function send(command) {
+        fetch('/c?val=' + command);
+    }
+
+    function setSpeed(value) {
+        document.getElementById('speedValue').innerText = value;
+        fetch('/s?val=' + value);
+    }
+
+    function updateStatus() {
+        fetch('/st')
+        .then(response => response.json())
+        .then(data => {
+
+            document.getElementById('status').innerText =
+                'Dashboard Connected';
+
+            document.getElementById('lat').innerText =
+                data.lat.toFixed(6);
+
+            document.getElementById('lng').innerText =
+                data.lng.toFixed(6);
+
+            document.getElementById('gpsSpeed').innerText =
+                data.spd;
+
+            document.getElementById('sat').innerText =
+                data.sat;
+
+            document.getElementById('speedValue').innerText =
+                data.mspd;
+
+            document.getElementById('obstacle').innerText =
+                data.obs ? 'OBSTACLE DETECTED' : 'Path Clear';
+
+            if (data.lat !== 0 && data.lng !== 0) {
+                document.getElementById('map').src =
+                    'https://maps.google.com/maps?q=' +
+                    data.lat + ',' + data.lng + '&z=15&output=embed';
+            }
+        })
+        .catch(() => {
+            document.getElementById('status').innerText =
+                'Connection Error';
+        });
+    }
+
+    setInterval(updateStatus, 2000);
+    updateStatus();
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+// ==================== WEB HANDLERS ====================
+
+void handleRoot() {
+    server.send_P(200, "text/html", index_html);
+}
+
+void handleCmd() {
+
+    String command = server.arg("val");
+    command.toUpperCase();
+
+    if (command == "S") {
+
+        currentCmd = "S";
+        emergencyStop = true;
+        stopMotors();
+
+    } else if (command == "F" ||
+               command == "B" ||
+               command == "L" ||
+               command == "R") {
+
+        currentCmd = command;
+        emergencyStop = false;
+        motorControl(currentCmd, motorSpeed);
+
+    } else {
+
+        server.send(400, "text/plain", "Invalid command");
+        return;
+    }
+
+    server.send(200, "text/plain", "OK");
+}
+
+void handleSpeed() {
+
+    int speed = server.arg("val").toInt();
+    motorSpeed = constrain(speed, 80, 255);
+
+    if (currentCmd != "S") {
+        motorControl(currentCmd, motorSpeed);
+    }
+
+    server.send(200, "text/plain", "OK");
+}
+
+void handleStatus() {
+
+    String json = "{";
+
+    json += "\"lat\":" + String(latitude, 6) + ",";
+    json += "\"lng\":" + String(longitude, 6) + ",";
+    json += "\"spd\":" + String(speedKPH, 1) + ",";
+    json += "\"sat\":" + String(satellites) + ",";
+    json += "\"mspd\":" + String(motorSpeed) + ",";
+    json += "\"obs\":" + String(obstacle ? "true" : "false");
+
+    json += "}";
+
+    server.send(200, "application/json", json);
+}
+
+void handleBuzzer() {
+
+    buzzerTest = !buzzerTest;
+
+    digitalWrite(
+        BUZZER,
+        buzzerTest ? HIGH : LOW
+    );
+
+    server.send(
+        200,
+        "text/plain",
+        buzzerTest ? "ON" : "OFF"
+    );
+}
+
+// ==================== SETUP ====================
+
+void setup() {
+
+    Serial.begin(115200);
+
+    Serial.println();
+    Serial.println("=== ESP32 SMART WHEELCHAIR ===");
+
+    // Configure motor pins
+    pinMode(IN1, OUTPUT);
+    pinMode(IN2, OUTPUT);
+    pinMode(IN3, OUTPUT);
+    pinMode(IN4, OUTPUT);
+
+    pinMode(ENA, OUTPUT);
+    pinMode(ENB, OUTPUT);
+
+    stopMotors();
+
+    // Configure sensors
+    pinMode(IR_SENSOR, INPUT);
+    pinMode(BUZZER, OUTPUT);
+
+    digitalWrite(BUZZER, LOW);
+
+    // Initialize GPS
+    GPS_Serial.begin(
+        9600,
+        SERIAL_8N1,
+        GPS_RX,
+        GPS_TX
+    );
+
+    // Initialize Bluetooth
+    SerialBT.begin("ESP32_WC");
+
+    // Connect to Wi-Fi
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+
+    Serial.print("Connecting to Wi-Fi");
+
+    int attempts = 0;
+
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+
+        Serial.println("Wi-Fi Connected");
+        Serial.print("Dashboard IP: ");
+        Serial.println(WiFi.localIP());
+
+        server.on("/", HTTP_GET, handleRoot);
+        server.on("/c", HTTP_GET, handleCmd);
+        server.on("/s", HTTP_GET, handleSpeed);
+        server.on("/st", HTTP_GET, handleStatus);
+        server.on("/b", HTTP_GET, handleBuzzer);
+
+        server.begin();
+
+        Serial.println("Web Server Started");
+
+    } else {
+
+        Serial.println("Wi-Fi Connection Failed");
+    }
+
+    // Create FreeRTOS tasks
+    xTaskCreatePinnedToCore(
+        obstacleTask, "Obstacle", 2048, NULL, 3, NULL, 1
+    );
+
+    xTaskCreatePinnedToCore(
+        gpsTask, "GPS", 4096, NULL, 1, NULL, 1
+    );
+
+    xTaskCreatePinnedToCore(
+        bluetoothTask, "Bluetooth", 4096, NULL, 2, NULL, 1
+    );
+
+    Serial.println("System Ready");
+    Serial.println("Bluetooth Name: ESP32_WC");
+
+    digitalWrite(BUZZER, HIGH);
+    delay(200);
+    digitalWrite(BUZZER, LOW);
+}
+
+// ==================== MAIN LOOP ====================
+
+void loop() {
+
+    if (WiFi.status() == WL_CONNECTED) {
+        server.handleClient();
+    }
+
+    delay(10);
+}
